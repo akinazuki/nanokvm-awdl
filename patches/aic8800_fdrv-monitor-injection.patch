@@ -1,0 +1,74 @@
+diff --color -ru -x * kern/linux/linux-4.19.125/drivers/net/wireless/aic8800/aic8800_fdrv/Makefile aic8800_mon/aic8800_fdrv/Makefile
+--- a/aic8800_fdrv/Makefile	2026-09-28 02:20:48
++++ b/aic8800_fdrv/Makefile	2026-09-28 02:31:35
+@@ -154,8 +154,8 @@
+ 
+ # Enable Monitor+Data interface support (need FW support)
+ CONFIG_RWNX_MON_DATA = n
+-CONFIG_RWNX_MON_XMIT = n
+-CONFIG_RWNX_MON_RXFILTER = n
++CONFIG_RWNX_MON_XMIT = y
++CONFIG_RWNX_MON_RXFILTER = y
+ 
+ 
+ # extra DEBUG config
+diff --color -ru -x * kern/linux/linux-4.19.125/drivers/net/wireless/aic8800/aic8800_fdrv/rwnx_main.c aic8800_mon/aic8800_fdrv/rwnx_main.c
+--- a/aic8800_fdrv/rwnx_main.c	2026-09-28 02:20:48
++++ b/aic8800_fdrv/rwnx_main.c	2026-09-28 03:31:57
+@@ -1174,7 +1174,9 @@
+ 		 netdev_br_init(dev);
+ 	#endif /* CONFIG_BR_SUPPORT */
+ 
+-	netif_carrier_off(dev);
++	// Keep carrier on for monitor vif, otherwise injected frames hit noop_qdisc
++	if (RWNX_VIF_TYPE(rwnx_vif) != NL80211_IFTYPE_MONITOR)
++		netif_carrier_off(dev);
+ 	netif_start_queue(dev);
+ 
+ 	return error;
+@@ -3562,13 +3564,9 @@
+ 
+ 	rwnx_vif = rwnx_hw->vif_table[rwnx_hw->monitor_vif];
+ 
+-	// Do nothing if monitor interface is already configured with the requested channel
+-	if (rwnx_chanctx_valid(rwnx_hw, rwnx_vif->ch_index)) {
+-		struct rwnx_chanctx *ctxt;
+-		ctxt = &rwnx_vif->rwnx_hw->chanctx_table[rwnx_vif->ch_index];
+-		if (chandef && cfg80211_chandef_identical(&ctxt->chan_def, chandef))
+-			return 0;
+-	}
++	// Don't skip when the cached chanctx matches the request: after the monitor vif is
++	// re-created (iftype change) the firmware is back on its default channel while the
++	// cached chan_def still holds the old one, so skipping leaves the radio mistuned.
+ 
+ 	// Always send command to firmware. It allows to retrieve channel context index
+ 	// and its configuration.
+diff --color -ru -x * kern/linux/linux-4.19.125/drivers/net/wireless/aic8800/aic8800_fdrv/rwnx_rx.c aic8800_mon/aic8800_fdrv/rwnx_rx.c
+--- a/aic8800_fdrv/rwnx_rx.c	2026-09-28 02:20:48
++++ b/aic8800_fdrv/rwnx_rx.c	2026-09-28 02:45:34
+@@ -2189,6 +2189,13 @@
+         u8 rtap_len;
+         u16 frm_len = 0;
+ 
++    #ifndef CONFIG_RWNX_MON_DATA
++        // Without MON_DATA there is no data vif to forward to, and the
++        // (status != RX_STAT_MONITOR) branch below would leave skb_monitor NULL.
++        // Treat MONITOR|FORWARD frames (e.g. auto_reply'd frames) as monitor-only.
++        status = RX_STAT_MONITOR;
++    #endif
++
+         //Check if monitor interface exists and is open
+         rwnx_vif = rwnx_rx_get_vif(rwnx_hw, rwnx_hw->monitor_vif);
+         if (!rwnx_vif) {
+diff --color -ru -x * kern/linux/linux-4.19.125/drivers/net/wireless/aic8800/aic8800_fdrv/rwnx_tx.c aic8800_mon/aic8800_fdrv/rwnx_tx.c
+--- a/aic8800_fdrv/rwnx_tx.c	2026-09-28 02:20:48
++++ b/aic8800_fdrv/rwnx_tx.c	2026-09-28 11:46:55
+@@ -2366,7 +2366,7 @@
+ 
+ 	/* Update txq and HW queue credits */
+ 	if (sw_txhdr->desc.host.flags & TXU_CNTRL_MGMT) {
+-		printk("done=%d retry_required=%d sw_retry_required=%d acknowledged=%d\n",
++		AICWFDBG(LOGDEBUG, "done=%d retry_required=%d sw_retry_required=%d acknowledged=%d\n",
+ 					 rwnx_txst.tx_done, rwnx_txst.retry_required,
+ 					 rwnx_txst.sw_retry_required, rwnx_txst.acknowledged);
+ #ifdef CREATE_TRACE_POINTS

@@ -1,0 +1,19 @@
+{
+  "app_id": "com.natsuki.awdl_toggle",
+  "name": "AWDL",
+  "creator": "natsuki",
+  "create_time": "2026-09-29",
+  "version": "1.0.0",
+  "desc": "Start/stop AWDL mode. Bundles the driver, OWL and scripts (installed on setup).",
+  "category": "network",
+  "env": {
+    "CHANNEL": {
+      "label": "AWDL channel",
+      "default": "44",
+      "required": false,
+      "secret": false,
+      "description": "Social channel: 6, 44, or 149"
+    }
+  },
+  "post_script": "post-install.sh"
+}

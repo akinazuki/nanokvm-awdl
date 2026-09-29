@@ -1,0 +1,91 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  owl:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Install checkout deps
+        run: apt-get update -qq && apt-get install -y -qq git ca-certificates
+      - uses: actions/checkout@v4
+      - name: Build OWL (armhf)
+        run: sh ci/build-owl.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: owl
+          path: out/owl
+          if-no-files-found: error
+
+  driver:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Install checkout deps
+        run: apt-get update -qq && apt-get install -y -qq git ca-certificates tar zstd
+      - uses: actions/checkout@v4
+      - name: Cache ARM toolchain
+        uses: actions/cache@v4
+        with:
+          path: /opt/toolchain
+          key: arm-gnu-10.3-2021.07-${{ runner.arch }}
+      - name: Build aic8800_fdrv.ko (armhf)
+        run: bash ci/build-driver.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: driver
+          path: out/aic8800_fdrv.ko
+          if-no-files-found: error
+
+  awdlkvm:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build awdlkvm (universal)
+        working-directory: mac/awdlkvm
+        run: |
+          swift build -c release --arch arm64 --arch x86_64
+          BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/awdlkvm"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          zip -j "$GITHUB_WORKSPACE/out/awdlkvm-macos.zip" "$BIN"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: awdlkvm-macos
+          path: out/awdlkvm-macos.zip
+          if-no-files-found: error
+
+  package:
+    needs: [owl, driver, awdlkvm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: owl
+          path: out
+      - uses: actions/download-artifact@v4
+        with:
+          name: driver
+          path: out
+      - uses: actions/download-artifact@v4
+        with:
+          name: awdlkvm-macos
+          path: out
+      - name: Assemble zip
+        run: sh ci/package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: awdl-toggle
+          path: out/awdl-toggle.zip
+          if-no-files-found: error
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" out/awdl-toggle.zip out/awdlkvm-macos.zip --title "${GITHUB_REF_NAME}" --generate-notes

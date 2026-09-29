@@ -1,0 +1,740 @@
+diff --git a/daemon/core.c b/daemon/core.c
+index 8b17ede..137a848 100644
+--- a/daemon/core.c
++++ b/daemon/core.c
+@@ -27,6 +27,16 @@
+ #include "schedule.h"
+ 
+ #include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <libgen.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <limits.h>
++#include <arpa/inet.h>
++#include <netinet/ether.h>
+ 
+ #ifdef __APPLE__
+ # define SIGSTATS SIGINFO
+@@ -373,11 +383,84 @@ int awdl_init(struct daemon_state *state, const char *wlan, const char *host, st
+ 	state->next = NULL;
+ 	state->tx_queue_multicast = circular_buf_init(16);
+ 	state->dump = dump;
++	state->services_file = NULL;
++	state->services_last = NULL;
+ 
+ 	return 0;
+ }
+ 
++#define AIRDROP_SERVICE_TIMEOUT_USEC (5 * 1000 * 1000)
++
++/* AirDrop peers seen in AWDL, for a client to read: instance\tipv6%iface\tport\tflags\tmac\tname per line */
++void awdl_write_services(struct ev_loop *loop __attribute__((unused)), ev_timer *timer,
++                         int revents __attribute__((unused))) {
++	struct daemon_state *state = timer->data;
++	struct awdl_peer *peer;
++	awdl_peers_it_t it;
++	size_t cap = 4096, used = 0;
++	char *content = malloc(cap);
++	char tmp[PATH_MAX];
++	FILE *f;
++
++	if (!content)
++		return;
++	content[0] = '\0';
++	it = awdl_peers_it_new(state->awdl_state.peers.peers);
++	while (awdl_peers_it_next(it, &peer) == PEERS_OK) {
++		struct in6_addr in6;
++		char addr[INET6_ADDRSTRLEN];
++		char line[512];
++		int n;
++		if (!peer->is_valid || !peer->airdrop.instance[0] || !peer->airdrop.port ||
++		    /* macOS announces AirDrop only while discoverable; drop stale peers */
++		    clock_time_us() - peer->airdrop.seen > AIRDROP_SERVICE_TIMEOUT_USEC)
++			continue;
++		rfc4291_addr(&peer->addr, &in6);
++		inet_ntop(AF_INET6, &in6, addr, sizeof(addr));
++		n = snprintf(line, sizeof(line), "%s\t%s%%%s\t%u\t%u\t%s\t%s\n", peer->airdrop.instance, addr,
++		             state->io.host_ifname, peer->airdrop.port, peer->airdrop.flags,
++		             ether_ntoa(&peer->addr), peer->name);
++		if (n <= 0 || n >= (int) sizeof(line))
++			continue;
++		if (used + n + 1 > cap) {
++			char *bigger = realloc(content, cap * 2);
++			if (!bigger)
++				break;
++			content = bigger;
++			cap *= 2;
++		}
++		memcpy(content + used, line, n + 1);
++		used += n;
++	}
++	awdl_peers_it_free(it);
++
++	if (state->services_last && !strcmp(state->services_last, content)) {
++		free(content);
++		return;
++	}
++	snprintf(tmp, sizeof(tmp), "%s.tmp", state->services_file);
++	f = fopen(tmp, "w");
++	if (!f) {
++		log_warn("cannot write %s: %s", tmp, strerror(errno));
++		free(content);
++		return;
++	}
++	fputs(content, f);
++	fclose(f);
++	if (rename(tmp, state->services_file) < 0) {
++		log_warn("cannot replace %s: %s", state->services_file, strerror(errno));
++		free(content);
++		return;
++	}
++	log_debug("AirDrop services updated (%zu bytes)", used);
++	free(state->services_last);
++	state->services_last = content;
++}
++
+ void awdl_free(struct daemon_state *state) {
++	if (state->services_file)
++		unlink(state->services_file);
++	free(state->services_last);
+ 	circular_buf_free(state->tx_queue_multicast);
+ 	io_state_free(&state->io);
+ 	netutils_cleanup();
+@@ -429,6 +512,16 @@ void awdl_schedule(struct ev_loop *loop, struct daemon_state *state) {
+ 	ev_timer_init(&state->ev_state.tx_mcast_timer, awdl_send_multicast, 0, 0);
+ 	ev_timer_start(loop, &state->ev_state.tx_mcast_timer);
+ 
++	if (state->services_file) {
++		char dir[PATH_MAX];
++		strncpy(dir, state->services_file, sizeof(dir) - 1);
++		dir[sizeof(dir) - 1] = '\0';
++		mkdir(dirname(dir), 0755);
++		state->ev_state.svc_timer.data = (void *) state;
++		ev_timer_init(&state->ev_state.svc_timer, awdl_write_services, 1., 1.);
++		ev_timer_start(loop, &state->ev_state.svc_timer);
++	}
++
+ 	/* Register signal to print statistics */
+ 	state->ev_state.stats.data = (void *) state;
+ 	ev_signal_init(&state->ev_state.stats, awdl_print_stats, SIGSTATS);
+diff --git a/daemon/core.h b/daemon/core.h
+index 7580133..51fba5c 100644
+--- a/daemon/core.h
++++ b/daemon/core.h
+@@ -29,7 +29,7 @@
+ 
+ struct ev_state {
+ 	struct ev_loop *loop;
+-	ev_timer mif_timer, psf_timer, tx_timer, tx_mcast_timer, chan_timer, peer_timer;
++	ev_timer mif_timer, psf_timer, tx_timer, tx_mcast_timer, chan_timer, peer_timer, svc_timer;
+ 	ev_io read_wlan, read_host;
+ 	ev_signal stats;
+ };
+@@ -42,6 +42,8 @@ struct daemon_state {
+ 	struct buf *next;
+ 	cbuf_handle_t tx_queue_multicast;
+ 	const char *dump;
++	const char *services_file;
++	char *services_last;
+ };
+ 
+ int awdl_init(struct daemon_state *state, const char *wlan, const char *host, struct awdl_chan chan, const char *dump);
+@@ -73,6 +75,8 @@ void awdl_switch_channel(struct ev_loop *loop, ev_timer *handle, int revents);
+ 
+ void awdl_clean_peers(struct ev_loop *loop, ev_timer *timer, int revents);
+ 
++void awdl_write_services(struct ev_loop *loop, ev_timer *timer, int revents);
++
+ void awdl_print_stats(struct ev_loop *loop, ev_signal *handle, int revents);
+ 
+ #endif /* OWL_CORE_H */
+diff --git a/daemon/netutils.c b/daemon/netutils.c
+index 5ce37d3..7455008 100644
+--- a/daemon/netutils.c
++++ b/daemon/netutils.c
+@@ -337,7 +337,7 @@ int is_channel_available(int ifindex, const int channel, bool *is_available) {
+ 			.last_band = -1,
+ 		},
+ 	};
+-	
++
+ 	freq = ieee80211_channel_to_frequency(channel);
+ 	if (!freq) {
+ 		log_error("Invalid channel number %d", channel);
+@@ -414,7 +414,20 @@ int set_channel(int ifindex, int channel) {
+ 
+ 	NLA_PUT_U32(m, NL80211_ATTR_IFINDEX, ifindex);
+ 	NLA_PUT_U32(m, NL80211_ATTR_WIPHY_FREQ, freq);
+-	NLA_PUT_U32(m, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_HT40PLUS);
++	if (channel > 14) {
++		/* AWDL 5GHz = opclass 128 (80MHz); tune the 80MHz block or 40MHz can't decode it */
++		int center;
++		if (channel >= 149)
++			center = 155;
++		else if (channel >= 100)
++			center = 106 + ((channel - 100) / 16) * 16;
++		else
++			center = 42 + ((channel - 36) / 16) * 16;
++		NLA_PUT_U32(m, NL80211_ATTR_CHANNEL_WIDTH, NL80211_CHAN_WIDTH_80);
++		NLA_PUT_U32(m, NL80211_ATTR_CENTER_FREQ1, ieee80211_channel_to_frequency(center));
++	} else {
++		NLA_PUT_U32(m, NL80211_ATTR_WIPHY_CHANNEL_TYPE, NL80211_CHAN_HT40PLUS);
++	}
+ 
+ 	err = nl_send_auto(nl80211_state.socket, m);
+ 	if (err < 0) {
+diff --git a/daemon/owl.c b/daemon/owl.c
+index 6136d39..cd5d434 100644
+--- a/daemon/owl.c
++++ b/daemon/owl.c
+@@ -21,6 +21,7 @@
+ #include <unistd.h>
+ #include <stdlib.h>
+ #include <signal.h>
++#include <string.h>
+ #include <syslog.h>
+ #include <errno.h>
+ #include <ev.h>
+@@ -82,6 +83,11 @@ static void daemonize() {
+ 	openlog("owl", LOG_PID, LOG_DAEMON);
+ }
+ 
++static void stop_loop(struct ev_loop *loop, ev_signal *handle __attribute__((unused)),
++                      int revents __attribute__((unused))) {
++	ev_break(loop, EVBREAK_ALL);
++}
++
+ int main(int argc, char *argv[]) {
+ 	int c;
+ 	int daemon = 0;
+@@ -94,12 +100,16 @@ int main(int argc, char *argv[]) {
+ 
+ 	char wlan[PATH_MAX] = "";
+ 	char host[IFNAMSIZ] = DEFAULT_AWDL_DEVICE;
++	const char *services_file = "/run/owl/airdrop.tsv";
++	const char *advertise = NULL;
++	int election_metric = 0;
++	int hop = 0;
+ 
+ 	struct ev_loop *loop;
+ 
+ 	struct daemon_state state;
+ 
+-	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fN")) != -1) {
++	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:A:M:H")) != -1) {
+ 		switch (c) {
+ 			case 'D':
+ 				daemon = 1;
+@@ -126,6 +136,18 @@ int main(int argc, char *argv[]) {
+ 			case 'N':
+ 				no_monitor_mode = 1;
+ 				break;
++			case 'S':
++				services_file = *optarg ? optarg : NULL;
++				break;
++			case 'A':
++				advertise = optarg;
++				break;
++			case 'H':
++				hop = 1;
++				break;
++			case 'M':
++				election_metric = atoi(optarg);
++				break;
+ 			case '?':
+ 				if (optopt == 'i')
+ 					fprintf(stderr, "Option -%c needs to specify a wireless interface.\n", optopt);
+@@ -193,6 +215,42 @@ int main(int argc, char *argv[]) {
+ 		return EXIT_FAILURE;
+ 	}
+ 	state.awdl_state.filter_rssi = filter_rssi;
++	state.services_file = services_file;
++	if (hop) {
++		awdl_chanseq_init_social(state.awdl_state.channel.sequence);
++		log_info("Using social channel-hopping sequence (44/6)");
++	}
++	if (election_metric > 0) {
++		/* election compares counter first; Macs' counters are huge, so counter wins, not metric */
++		uint32_t counter = 100000000;
++		state.awdl_state.election.self_metric = (uint32_t) election_metric;
++		state.awdl_state.election.master_metric = (uint32_t) election_metric;
++		state.awdl_state.election.self_counter = counter;
++		state.awdl_state.election.master_counter = counter;
++		log_info("Election metric=%d counter=%u (will become AWDL master)", election_metric, counter);
++	}
++	if (advertise) {
++		char tmp[256];
++		char *instance, *label, *port, *txt, *save = NULL;
++		strncpy(tmp, advertise, sizeof(tmp) - 1);
++		tmp[sizeof(tmp) - 1] = '\0';
++		instance = strtok_r(tmp, ",", &save);
++		label = strtok_r(NULL, ",", &save);
++		port = strtok_r(NULL, ",", &save);
++		txt = strtok_r(NULL, ",", &save);
++		if (instance && label && port) {
++			strncpy(state.awdl_state.service_instance, instance, sizeof(state.awdl_state.service_instance) - 1);
++			strncpy(state.awdl_state.service_label, label, sizeof(state.awdl_state.service_label) - 1);
++			if (txt)
++				strncpy(state.awdl_state.service_txt, txt, sizeof(state.awdl_state.service_txt) - 1);
++			state.awdl_state.service_port = (uint16_t) atoi(port);
++			log_info("Advertising %s.%s._tcp.local port %u over AWDL",
++			         state.awdl_state.service_instance, state.awdl_state.service_label,
++			         state.awdl_state.service_port);
++		} else {
++			log_error("Invalid -A format; use instance,label,port[,txt]");
++		}
++	}
+ 
+ 	if (state.io.wlan_ifindex)
+ 		log_info("WLAN device: %s (addr %s)", state.io.wlan_ifname, ether_ntoa(&state.io.if_ether_addr));
+@@ -203,6 +261,12 @@ int main(int argc, char *argv[]) {
+ 
+ 	awdl_schedule(loop, &state);
+ 
++	ev_signal sigint, sigterm;
++	ev_signal_init(&sigint, stop_loop, SIGINT);
++	ev_signal_start(loop, &sigint);
++	ev_signal_init(&sigterm, stop_loop, SIGTERM);
++	ev_signal_start(loop, &sigterm);
++
+ 	ev_run(loop, 0);
+ 
+ 	awdl_free(&state);
+diff --git a/src/channel.c b/src/channel.c
+index e2c57ad..e1f5a4f 100644
+--- a/src/channel.c
++++ b/src/channel.c
+@@ -47,6 +47,16 @@ void awdl_chanseq_init_idle(struct awdl_chan *seq) {
+ 	}
+ }
+ 
++/* ch44, plus ch6 at slot 8 to overlap a Mac's idle availability */
++void awdl_chanseq_init_social(struct awdl_chan *seq) {
++	for (int i = 0; i < AWDL_CHANSEQ_LENGTH; i++) {
++		if (i == 8)
++			seq[i] = CHAN_OPCLASS_6;
++		else
++			seq[i] = CHAN_OPCLASS_44;
++	}
++}
++
+ void awdl_chanseq_init_static(struct awdl_chan *seq, const struct awdl_chan *chan) {
+ 	for (int i = 0; i < AWDL_CHANSEQ_LENGTH; i++, seq++) {
+ 		*seq = *chan;
+diff --git a/src/channel.h b/src/channel.h
+index 10e60a8..58d9652 100644
+--- a/src/channel.h
++++ b/src/channel.h
+@@ -68,5 +68,6 @@ void awdl_chanseq_init(struct awdl_chan *seq);
+ void awdl_chanseq_init_idle(struct awdl_chan *seq);
+ 
+ void awdl_chanseq_init_static(struct awdl_chan *seq, const struct awdl_chan *chan);
++void awdl_chanseq_init_social(struct awdl_chan *seq);
+ 
+ #endif /* AWDL_CHANNEL_H_ */
+diff --git a/src/peers.c b/src/peers.c
+index a56d0c4..783dc39 100644
+--- a/src/peers.c
++++ b/src/peers.c
+@@ -74,6 +74,7 @@ struct awdl_peer *awdl_peer_new(const struct ether_addr *addr) {
+ 	peer->version = 0;
+ 	peer->supports_v2 = 0;
+ 	peer->sent_mif = 0;
++	memset(&peer->airdrop, 0, sizeof(peer->airdrop));
+ 	strcpy(peer->name, "");
+ 	strcpy(peer->country_code, "NA");
+ 	peer->is_valid = 0;
+diff --git a/src/peers.h b/src/peers.h
+index eaa9945..8ed6ed8 100644
+--- a/src/peers.h
++++ b/src/peers.h
+@@ -35,6 +35,15 @@ enum peers_status {
+ 	PEERS_INTERNAL = -2, /* Internal error */
+ };
+ 
++#define AWDL_SERVICE_INSTANCE_MAX 63
++
++struct awdl_airdrop_service {
++	char instance[AWDL_SERVICE_INSTANCE_MAX + 1];
++	uint16_t port;
++	uint32_t flags;
++	uint64_t seen;
++};
++
+ struct awdl_peer {
+ 	const struct ether_addr addr;
+ 	uint64_t last_update;
+@@ -44,6 +53,7 @@ struct awdl_peer {
+ 	char name[HOST_NAME_LENGTH_MAX + 1]; /* space for trailing zero */
+ 	char country_code[2 + 1];
+ 	struct ether_addr infra_addr;
++	struct awdl_airdrop_service airdrop;
+ 	uint8_t version;
+ 	uint8_t devclass;
+ 	uint8_t supports_v2 : 1;
+diff --git a/src/rx.c b/src/rx.c
+index 9c0d68e..b680787 100644
+--- a/src/rx.c
++++ b/src/rx.c
+@@ -18,6 +18,8 @@
+  */
+ 
+ #include <string.h>
++#include <strings.h>
++#include <stdlib.h>
+ #include <errno.h>
+ #include <netinet/in.h>
+ #include <netinet/ip6.h>
+@@ -205,6 +207,125 @@ wire_error:
+ 	return RX_TOO_SHORT;
+ }
+ 
++/* AWDL DNS compression: codes 0xC000..0xC00E -> these suffixes (0xC000 = empty) */
++static const char *const awdl_dns_dictionary[] = {
++	NULL, "_airplay._tcp.local", "_airplay._udp.local", "_airplay",
++	"_raop._tcp.local", "_raop._udp.local", "_raop", "_airdrop._tcp.local",
++	"_airdrop._udp.local", "_airdrop", "_tcp.local", "_udp.local", "local", "ip6.arpa", "ip4.arpa",
++};
++
++static int awdl_dns_name_decode(const uint8_t *data, int len, char *out, size_t out_len) {
++	size_t used = 0;
++	int i = 0;
++	out[0] = '\0';
++	while (i < len) {
++		const char *component;
++		size_t component_len;
++		char label[64];
++		if (data[i] & 0xc0) {
++			unsigned code;
++			if (i + 2 > len)
++				return -1;
++			code = ((unsigned) (data[i] & 0x3f) << 8) | data[i + 1];
++			i += 2;
++			if (code >= sizeof(awdl_dns_dictionary) / sizeof(awdl_dns_dictionary[0]))
++				return -1;
++			component = awdl_dns_dictionary[code];
++			if (!component)
++				continue;
++			component_len = strlen(component);
++		} else {
++			component_len = data[i];
++			if (i + 1 + (int) component_len > len || component_len >= sizeof(label))
++				return -1;
++			memcpy(label, data + i + 1, component_len);
++			label[component_len] = '\0';
++			component = label;
++			i += 1 + component_len;
++		}
++		if (used + (used ? 1 : 0) + component_len + 1 > out_len)
++			return -1;
++		if (used)
++			out[used++] = '.';
++		memcpy(out + used, component, component_len);
++		used += component_len;
++		out[used] = '\0';
++	}
++	return 0;
++}
++
++#define AWDL_AIRDROP_SERVICE "_airdrop._tcp.local"
++
++/* service TLV: name_len(LE16, +1 for the type byte), name, type, data_len(LE16), 2 pad, rdata */
++int awdl_handle_service_response_tlv(struct awdl_peer *src, const struct buf *val,
++                                     struct awdl_state *state __attribute__((unused)), uint64_t now) {
++	const uint8_t *data = buf_data(val);
++	int len = buf_len(val);
++	char name[256], target[256];
++	int name_len, offset, data_len;
++	uint8_t type;
++	size_t service_len = strlen(AWDL_AIRDROP_SERVICE);
++	size_t n;
++
++	if (len < 2)
++		return RX_IGNORE;
++	name_len = data[0] | (data[1] << 8);
++	if (name_len < 1 || 2 + name_len + 4 > len)
++		return RX_IGNORE;
++	if (awdl_dns_name_decode(data + 2, name_len - 1, name, sizeof(name)))
++		return RX_IGNORE;
++	offset = 2 + name_len - 1;
++	type = data[offset++];
++	data_len = data[offset] | (data[offset + 1] << 8);
++	offset += 4; /* data_len + 2 pad bytes */
++	if (offset + data_len > len)
++		return RX_IGNORE;
++	data += offset;
++	n = strlen(name);
++
++	if (type == 12  && !strcasecmp(name, AWDL_AIRDROP_SERVICE)) {
++		if (awdl_dns_name_decode(data, data_len, target, sizeof(target)))
++			return RX_IGNORE;
++		if (strcasecmp(src->airdrop.instance, target)) {
++			strncpy(src->airdrop.instance, target, AWDL_SERVICE_INSTANCE_MAX);
++			src->airdrop.instance[AWDL_SERVICE_INSTANCE_MAX] = '\0';
++			src->airdrop.port = 0;
++			src->airdrop.flags = 0;
++			log_debug("peer %s advertises AirDrop instance %s", ether_ntoa(&src->addr), src->airdrop.instance);
++		}
++		src->airdrop.seen = now;
++		return RX_OK;
++	}
++
++	if (n <= service_len + 1 || strcasecmp(name + n - service_len, AWDL_AIRDROP_SERVICE) ||
++	    name[n - service_len - 1] != '.' || !src->airdrop.instance[0] ||
++	    strlen(src->airdrop.instance) != n - service_len - 1 ||
++	    strncasecmp(name, src->airdrop.instance, n - service_len - 1))
++		return RX_IGNORE;
++
++	if (type == 33 ) {
++		if (data_len < 6)
++			return RX_IGNORE;
++		src->airdrop.port = (uint16_t) ((data[4] << 8) | data[5]);
++	} else if (type == 16 ) {
++		int i = 0;
++		while (i < data_len) {
++			int l = data[i];
++			char entry[64];
++			if (i + 1 + l > data_len)
++				break;
++			if (l < (int) sizeof(entry)) {
++				memcpy(entry, data + i + 1, l);
++				entry[l] = '\0';
++				if (!strncasecmp(entry, "flags=", 6))
++					src->airdrop.flags = (uint32_t) strtoul(entry + 6, NULL, 10);
++			}
++			i += 1 + l;
++		}
++	}
++	return RX_OK;
++}
++
+ int awdl_handle_tlv(struct awdl_peer *src, uint8_t type, const struct buf *val,
+                     struct awdl_state *state, uint64_t tsft) {
+ 	switch (type) {
+@@ -222,6 +343,8 @@ int awdl_handle_tlv(struct awdl_peer *src, uint8_t type, const struct buf *val,
+ 			return awdl_handle_data_path_state_tlv(src, val, state);
+ 		case AWDL_VERSION_TLV:
+ 			return awdl_handle_version_tlv(src, val, state);
++		case AWDL_SERVICE_RESPONSE_TLV:
++			return awdl_handle_service_response_tlv(src, val, state, tsft);
+ 		case AWDL_SYNCTREE_TLV: /* seems to be buggy, not used in our election process */
+ 			/* fall through */
+ 		default:
+@@ -305,9 +428,12 @@ int awdl_rx_action(const struct buf *frame, signed char rssi, uint64_t tsft,
+ 		buf_strip(frame, len);
+ 	}
+ 
+-	if (buf_len(frame) > 0) {
++	if (buf_len(frame) >= 3) {
+ 		log_debug("awdl_action: unexpected bytes (%d) at end of frame", buf_len(frame));
+ 		return RX_UNEXPECTED_FORMAT;
++	} else if (buf_len(frame) > 0) {
++		/* newer macOS pads MIFs with < 3 zero bytes; don't reject the frame for them */
++		log_trace("awdl_action: ignoring %d padding bytes at end of frame", buf_len(frame));
+ 	}
+ 
+ 	if (subtype == AWDL_ACTION_MIF)
+diff --git a/src/state.h b/src/state.h
+index 3b33dd8..db5921a 100644
+--- a/src/state.h
++++ b/src/state.h
+@@ -54,6 +54,11 @@ struct awdl_state {
+ 	uint8_t version;
+ 	uint8_t dev_class;
+ 
++	char service_instance[64];
++	char service_label[32];
++	char service_txt[64];
++	uint16_t service_port;
++
+ 	/* sequence number for data frames */
+ 	uint16_t sequence_number;
+ 	/* PSF interval (in TU) */
+diff --git a/src/tx.c b/src/tx.c
+index b98db03..0814e81 100644
+--- a/src/tx.c
++++ b/src/tx.c
+@@ -18,6 +18,7 @@
+  */
+ 
+ #include <stdint.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include <radiotap.h>
+@@ -318,6 +319,44 @@ int ieee80211_init_radiotap_header(uint8_t *buf) {
+ 	return ptr - buf;
+ }
+ 
++static int data_mcs(void) {
++	static int mcs = -2;
++	if (mcs == -2) {
++		const char *env = getenv("OWL_DATA_MCS");
++		mcs = env ? atoi(env) : 5;
++	}
++	return mcs;
++}
++
++/* fixed 40MHz HT/VHT MCS instead of 12M legacy; multicast keeps the robust rate */
++int ieee80211_init_radiotap_header_data(uint8_t *buf, int is_5ghz) {
++	struct ieee80211_radiotap_header *hdr = (struct ieee80211_radiotap_header *) buf;
++	uint8_t *ptr = buf + sizeof(struct ieee80211_radiotap_header);
++	int mcs = data_mcs();
++
++	if (mcs < 0)
++		return ieee80211_init_radiotap_header(buf);
++
++	hdr->it_version = 0;
++	hdr->it_pad = 0;
++	if (is_5ghz) {
++		memset(ptr, 0, 12);
++		*(uint16_t *) ptr = htole16(0x0004  | 0x0040 );
++		ptr[3] = 1;
++		ptr[4] = (uint8_t) (((mcs > 9 ? 9 : mcs) << 4) | 1);
++		ptr += 12;
++		hdr->it_present = htole32(1u << 21);
++	} else {
++		ptr[0] = 0x01  | 0x02  | 0x04 ;
++		ptr[1] = 1;
++		ptr[2] = (uint8_t) (mcs > 7 ? 7 : mcs);
++		ptr += 3;
++		hdr->it_present = htole32(1u << 19);
++	}
++	hdr->it_len = htole16((uint16_t) (ptr - buf));
++	return ptr - buf;
++}
++
+ int ieee80211_init_awdl_hdr(uint8_t *buf, const struct ether_addr *src, const struct ether_addr *dst,
+                             struct ieee80211_state *state, uint16_t type) {
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *) buf;
+@@ -360,6 +399,92 @@ int ieee80211_add_fcs(const uint8_t *start, uint8_t *end) {
+ 	return sizeof(uint32_t);
+ }
+ 
++
++#define AWDL_DNS_C_NULL       0xc000
++#define AWDL_DNS_C_TCP_LOCAL  0xc00a
++#define AWDL_DNS_C_LOCAL      0xc00c
++
++static uint8_t *awdl_dns_put_u16be(uint8_t *p, uint16_t v) {
++	*p++ = (uint8_t) (v >> 8);
++	*p++ = (uint8_t) (v & 0xff);
++	return p;
++}
++
++static uint8_t *awdl_dns_put_label(uint8_t *p, const char *s) {
++	size_t n = strlen(s);
++	if (n > 63)
++		n = 63;
++	*p++ = (uint8_t) n;
++	memcpy(p, s, n);
++	return p + n;
++}
++
++/* one service TLV; layout mirrors the parser in rx.c */
++static uint8_t *awdl_put_service_tlv(uint8_t *p, const uint8_t *name, int name_len,
++                                     uint8_t rtype, const uint8_t *rdata, int rdata_len) {
++	uint8_t *taglen, *val;
++	*p++ = AWDL_SERVICE_RESPONSE_TLV;
++	taglen = p;
++	p += 2;
++	val = p;
++	*p++ = (uint8_t) ((name_len + 1) & 0xff);
++	*p++ = (uint8_t) ((name_len + 1) >> 8);
++	memcpy(p, name, name_len);
++	p += name_len;
++	*p++ = rtype;
++	*p++ = (uint8_t) (rdata_len & 0xff);
++	*p++ = (uint8_t) (rdata_len >> 8);
++	*p++ = 0;
++	*p++ = 0;
++	memcpy(p, rdata, rdata_len);
++	p += rdata_len;
++	taglen[0] = (uint8_t) ((p - val) & 0xff);
++	taglen[1] = (uint8_t) ((p - val) >> 8);
++	return p;
++}
++
++int awdl_init_service_response_tlv(uint8_t *buf, const struct awdl_state *state) {
++	uint8_t type_name[96], inst_name[160], rdata[160];
++	uint8_t *p = buf, *n, *r;
++	int type_name_len, inst_name_len;
++
++	if (!state->service_port || !state->service_instance[0] || !state->service_label[0])
++		return 0;
++
++	n = type_name;
++	n = awdl_dns_put_label(n, state->service_label);
++	n = awdl_dns_put_u16be(n, AWDL_DNS_C_TCP_LOCAL);
++	type_name_len = n - type_name;
++
++	n = inst_name;
++	n = awdl_dns_put_label(n, state->service_instance);
++	n = awdl_dns_put_label(n, state->service_label);
++	n = awdl_dns_put_u16be(n, AWDL_DNS_C_TCP_LOCAL);
++	inst_name_len = n - inst_name;
++
++	r = rdata;
++	r = awdl_dns_put_label(r, state->service_instance);
++	r = awdl_dns_put_u16be(r, AWDL_DNS_C_NULL);
++	p = awdl_put_service_tlv(p, type_name, type_name_len, 12, rdata, r - rdata);
++
++	r = rdata;
++	r = awdl_dns_put_u16be(r, 0);
++	r = awdl_dns_put_u16be(r, 0);
++	r = awdl_dns_put_u16be(r, state->service_port);
++	r = awdl_dns_put_label(r, state->name);
++	r = awdl_dns_put_u16be(r, AWDL_DNS_C_LOCAL);
++	p = awdl_put_service_tlv(p, inst_name, inst_name_len, 33, rdata, r - rdata);
++
++	r = rdata;
++	if (state->service_txt[0])
++		r = awdl_dns_put_label(r, state->service_txt);
++	else
++		*r++ = 0;
++	p = awdl_put_service_tlv(p, inst_name, inst_name_len, 16, rdata, r - rdata);
++
++	return p - buf;
++}
++
+ int awdl_init_full_action_frame(uint8_t *buf, struct awdl_state *state, struct ieee80211_state *ieee80211_state,
+                                 enum awdl_action_type type) {
+ 	uint8_t *ptr = buf;
+@@ -376,6 +501,8 @@ int awdl_init_full_action_frame(uint8_t *buf, struct awdl_state *state, struct i
+ 		ptr += awdl_init_ht_capabilities_tlv(ptr, state);
+ 	if (type == AWDL_ACTION_MIF)
+ 		ptr += awdl_init_arpa_tlv(ptr, state);
++	if (type == AWDL_ACTION_MIF)
++		ptr += awdl_init_service_response_tlv(ptr, state);
+ 	ptr += awdl_init_data_path_state_tlv(ptr, state);
+ 	ptr += awdl_init_version_tlv(ptr, state);
+ 	if (ieee80211_state->fcs)
+@@ -389,7 +516,10 @@ int awdl_init_full_data_frame(uint8_t *buf, const struct ether_addr *src, const
+                               struct awdl_state *state, struct ieee80211_state *ieee80211_state) {
+ 	uint8_t *ptr = buf;
+ 
+-	ptr += ieee80211_init_radiotap_header(ptr);
++	if (dst->ether_addr_octet[0] & 0x01)
++		ptr += ieee80211_init_radiotap_header(ptr);
++	else
++		ptr += ieee80211_init_radiotap_header_data(ptr, awdl_chan_num(state->channel.current, state->channel.enc) > 14);
+ 	ptr += ieee80211_init_awdl_data_hdr(ptr, src, dst, ieee80211_state);
+ 	ptr += llc_init_awdl_hdr(ptr);
+ 	ptr += awdl_init_data(ptr, state);
+diff --git a/src/tx.h b/src/tx.h
+index 57586bd..5376985 100644
+--- a/src/tx.h
++++ b/src/tx.h
+@@ -49,6 +49,8 @@ int awdl_init_data_path_state_tlv(uint8_t *buf, const struct awdl_state *);
+ 
+ int awdl_init_arpa_tlv(uint8_t *buf, const struct awdl_state *);
+ 
++int awdl_init_service_response_tlv(uint8_t *buf, const struct awdl_state *);
++
+ int awdl_init_version_tlv(uint8_t *buf, const struct awdl_state *);
+ 
+ int awdl_init_full_action_frame(uint8_t *buf, struct awdl_state *, struct ieee80211_state *, enum awdl_action_type);
